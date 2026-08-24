@@ -1,0 +1,270 @@
+#!/usr/bin/env bash
+# zcode-rtl-patch — RTL/LTR auto-direction fix for the ZCode Electron app.
+#
+# Extracts /opt/ZCode/resources/app.asar, injects a self-contained script into
+# the renderer index.html (CSS is injected at runtime, so nothing depends on
+# hashed asset filenames), repacks and installs it with a timestamped backup.
+#
+# Usage:
+#   zcode-rtl-patch            patch the installed app
+#   zcode-rtl-patch --restore  restore the most recent backup
+#   zcode-rtl-patch <asar>     patch an arbitrary asar (e.g. for testing)
+#
+# Env: ZCODE_RTL_SKIP_DEPLOY=1  build the patched asar but skip backup/deploy.
+set -euo pipefail
+
+ASAR_DEFAULT="/opt/ZCode/resources/app.asar"
+TARGET="$ASAR_DEFAULT"
+MODE="patch"
+
+case "${1:-}" in
+  --restore) MODE="restore" ;;
+  "") ;;
+  *) TARGET="$1" ;;
+esac
+
+msg() { printf '%s\n' "$*"; }
+die() { msg "خطا: $*" >&2; exit 1; }
+
+run_root() {
+  if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi
+}
+
+# ---------------------------------------------------------------- restore --
+if [ "$MODE" = "restore" ]; then
+  [ -f "$TARGET" ] || die "فایل $TARGET پیدا نشد."
+  BACKUP="$(ls -t "$TARGET".bak "$TARGET".bak.* 2>/dev/null | head -1 || true)"
+  [ -n "$BACKUP" ] || die "هیچ بکاپی برای بازگردانی پیدا نشد."
+  msg "» بازگردانی $BACKUP"
+  run_root cp "$BACKUP" "$TARGET"
+  msg "✓ انجام شد. ZCode را کاملاً ببندید و دوباره باز کنید."
+  exit 0
+fi
+
+# ------------------------------------------------------------------ patch --
+[ -f "$TARGET" ] || die "فایل $TARGET پیدا نشد. آیا ZCode نصب است؟"
+command -v npx >/dev/null || die "npx در دسترس نیست (Node.js لازم است)."
+command -v python3 >/dev/null || die "python3 در دسترس نیست."
+
+WORK="$(mktemp -d /tmp/zcode-rtl-patch.XXXXXX)"
+if [ "${ZCODE_RTL_KEEP:-0}" != "1" ]; then
+  trap 'rm -rf "$WORK"' EXIT
+fi
+
+msg "» استخراج آرشیو..."
+mkdir -p "$WORK/app"
+npx --yes @electron/asar extract "$TARGET" "$WORK/app"
+
+INDEX="$(find "$WORK/app" -type f -name index.html -path '*renderer*' -print -quit)"
+[ -z "$INDEX" ] && INDEX="$(find "$WORK/app" -type f -name index.html -print -quit)"
+[ -n "$INDEX" ] || die "index.html رندرر در آرشیو پیدا نشد."
+msg "» رندرر: ${INDEX#"$WORK/app/"}"
+
+if grep -q "zcode-rtl-patch\|RTL smart fix" "$INDEX"; then
+  msg "✓ این نسخه قبلاً پچ شده است؛ کاری انجام نشد."
+  exit 0
+fi
+
+cat > "$WORK/payload.js" <<'ZCODE_RTL_PAYLOAD'
+/* zcode-rtl-patch v4 — RTL/LTR auto-direction for ZCode chat messages.
+   Classifier ported from ~/projects/vte-rtl-heuristic: whitespace tokens vote
+   by the majority of their strong letters (threshold 0.55, 3-token floor for
+   RTL, digits/marks/punctuation neutral). Neutral blocks inherit direction
+   from adjacent blocks; ambiguous ones fall back to unicode-bidi: plaintext
+   (first strong character). Inline technical tokens (code, links) are
+   isolated so Persian punctuation flow is not disturbed. */
+(function () {
+  var CSS =
+    "/* zcode-rtl-patch */" +
+    ".prose,.prose p,.prose li,.prose h1,.prose h2,.prose h3,.prose h4,.prose h5,.prose h6," +
+    ".prose blockquote,.prose td,.prose th,.prose dd,.prose dt,.prose figcaption,.prose summary," +
+    "[data-streamdown],[data-streamdown] p,[data-streamdown] li,[data-streamdown] h1," +
+    "[data-streamdown] h2,[data-streamdown] h3,[data-streamdown] h4,[data-streamdown] h5," +
+    "[data-streamdown] h6,[data-streamdown] blockquote,[data-streamdown] td,[data-streamdown] th," +
+    "[data-streamdown] dd,[data-streamdown] dt,[data-streamdown] figcaption,[data-streamdown] summary" +
+    "{unicode-bidi:plaintext;text-align:start}" +
+    "[data-streamdown] code,[data-streamdown] a,[data-streamdown] kbd,[data-streamdown] samp," +
+    ".prose code,.prose a,.prose kbd,.prose samp," +
+    ".zcode-rtl-root code,.zcode-rtl-root a,.zcode-rtl-root kbd,.zcode-rtl-root samp" +
+    "{unicode-bidi:isolate}";
+  var style = document.createElement("style");
+  style.textContent = CSS;
+  (document.head || document.documentElement).appendChild(style);
+
+  /* Strong letters only — digits, marks, ZWNJ and punctuation stay neutral. */
+  var RTL = /[\u05D0-\u05EA\u0620-\u064A\u066E-\u06D3\u06FA-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFE]/g;
+  var LTR = /[A-Za-z\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u024F\u0370-\u03FF\u0400-\u04FF]/g;
+  var THRESHOLD = 0.55;
+  var BLOCKS =
+    "p, li, h1, h2, h3, h4, h5, h6, blockquote, td, th, dd, dt, figcaption, summary";
+
+  /* Returns "rtl", "ltr", "auto" (ambiguous → CSS first-strong fallback) or
+     "neutral" (no strong letters → inherit from adjacent blocks). */
+  function analyze(text) {
+    var rtl = 0, ltr = 0, rtlTokens = 0, ltrTokens = 0;
+    var words = text.split(/\s+/);
+    for (var i = 0; i < words.length; i++) {
+      var r = (words[i].match(RTL) || []).length;
+      var l = (words[i].match(LTR) || []).length;
+      if (r > l) rtlTokens++;
+      else if (l > 0) ltrTokens++;
+      rtl += r;
+      ltr += l;
+    }
+    var strong = rtl + ltr;
+    if (!strong) return "neutral";
+    var rtlRatio = rtl / strong;
+    var tokenRatio = rtlTokens / (rtlTokens + ltrTokens || 1);
+    if (
+      rtl >= 2 &&
+      (rtlTokens >= 3 ||
+        rtlRatio >= THRESHOLD ||
+        (rtlTokens >= 2 && tokenRatio >= THRESHOLD))
+    )
+      return "rtl";
+    if (
+      ltr >= 2 &&
+      (1 - rtlRatio >= THRESHOLD ||
+        (ltrTokens >= 2 && 1 - tokenRatio >= THRESHOLD))
+    )
+      return "ltr";
+    return "auto";
+  }
+
+  function setDir(el, d) {
+    if (d === (el.dataset.zcodeDir || "")) return;
+    if (!d) {
+      delete el.dataset.zcodeDir;
+      el.style.direction = "";
+      el.style.unicodeBidi = "";
+      el.style.textAlign = "";
+      return;
+    }
+    el.dataset.zcodeDir = d;
+    el.style.direction = d;
+    el.style.unicodeBidi = "isolate";
+    el.style.textAlign = "start";
+  }
+
+  function decided(d) {
+    return d === "rtl" || d === "ltr";
+  }
+
+  /* Message roots: chat markdown is streamdown-rendered and tags its
+     headings, lists, list items and tables with [data-streamdown]; the
+     untagged parent of the topmost tagged element is the message body.
+     Paragraph-only messages carry no tag, so also anchor on the
+     MessageResponse container signature class (version heuristic) and on
+     .prose contexts (release notes, wiki). */
+  function messageRoots() {
+    var found = new Map();
+    var tagged = document.querySelectorAll("[data-streamdown]");
+    for (var i = 0; i < tagged.length; i++) {
+      var el = tagged[i];
+      while (
+        el.parentElement &&
+        el.parentElement.hasAttribute("data-streamdown")
+      )
+        el = el.parentElement;
+      var root = el.parentElement;
+      if (root && root !== document.body) found.set(root, 1);
+    }
+    var plain = document.querySelectorAll("div.leading-\\[1\\.75\\]");
+    for (var p = 0; p < plain.length; p++) found.set(plain[p], 1);
+    var prose = document.querySelectorAll(".prose");
+    for (var j = 0; j < prose.length; j++) found.set(prose[j], 1);
+    return found;
+  }
+
+  function scan() {
+    messageRoots().forEach(function (_, root) {
+      if (!root.classList.contains("zcode-rtl-root"))
+        root.classList.add("zcode-rtl-root");
+      var nodes = root.querySelectorAll(BLOCKS);
+      var list = [];
+      for (var i = 0; i < nodes.length; i++)
+        list.push({
+          el: nodes[i],
+          own: analyze(nodes[i].textContent || ""),
+        });
+      for (var n = 0; n < list.length; n++) {
+        var item = list[n];
+        if (decided(item.own)) {
+          setDir(item.el, item.own);
+          continue;
+        }
+        var d = "";
+        if (item.own === "neutral") {
+          for (var j = n - 1; j >= 0 && !d; j--)
+            if (decided(list[j].own)) d = list[j].own;
+          for (var k = n + 1; k < list.length && !d; k++)
+            if (decided(list[k].own)) d = list[k].own;
+        }
+        setDir(item.el, d);
+      }
+    });
+  }
+
+  var t = null;
+  function schedule() {
+    if (t) clearTimeout(t);
+    t = setTimeout(scan, 200);
+  }
+
+  function start() {
+    new MutationObserver(schedule).observe(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+    scan();
+  }
+  if (document.body) start();
+  else document.addEventListener("DOMContentLoaded", start);
+})();
+ZCODE_RTL_PAYLOAD
+
+msg "» تزریق وصله..."
+python3 - "$INDEX" "$WORK/payload.js" <<'PYEOF'
+import re, sys
+
+index_path, payload_path = sys.argv[1], sys.argv[2]
+html = open(index_path, encoding="utf-8").read()
+payload = open(payload_path, encoding="utf-8").read()
+block = "<script>\n" + payload + "</script>"
+
+m = re.search(r"</body>", html, re.IGNORECASE)
+if m:
+    html = html[: m.start()] + block + "\n" + html[m.start() :]
+elif re.search(r"</html>", html, re.IGNORECASE):
+    m = re.search(r"</html>", html, re.IGNORECASE)
+    html = html[: m.start()] + block + "\n" + html[m.start() :]
+else:
+    html += "\n" + block + "\n"
+
+open(index_path, "w", encoding="utf-8").write(html)
+print("injected OK")
+PYEOF
+
+msg "» بسته‌بندی مجدد..."
+npx --yes @electron/asar pack "$WORK/app" "$WORK/app-patched.asar"
+
+ORIG_COUNT="$(npx --yes @electron/asar list "$TARGET" | wc -l)"
+NEW_COUNT="$(npx --yes @electron/asar list "$WORK/app-patched.asar" | wc -l)"
+[ "$ORIG_COUNT" = "$NEW_COUNT" ] \
+  || die "تعداد فایل‌های آرشیو پس از بسته‌بندی تغییر کرد ($ORIG_COUNT → $NEW_COUNT)؛ نصب لغو شد."
+
+if [ "${ZCODE_RTL_SKIP_DEPLOY:-0}" = "1" ]; then
+  msg "✓ نسخهٔ پچ‌شده ساخته شد (بدون نصب): $WORK/app-patched.asar"
+  exit 0
+fi
+
+BACKUP="$TARGET.bak.$(date +%Y%m%d-%H%M%S)"
+msg "» بکاپ: $BACKUP"
+run_root cp "$TARGET" "$BACKUP"
+
+msg "» نصب..."
+run_root cp "$WORK/app-patched.asar" "$TARGET"
+
+msg "✓ پچ نصب شد. ZCode را کاملاً ببندید (از system tray هم) و دوباره باز کنید."
+msg "  بازگردانی: zcode-rtl-patch --restore"
